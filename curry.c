@@ -59,6 +59,7 @@
  *       0xb8, [le32] = movl $imm32, %eax
  * 0x48, 0x__, [le64] = movq $imm64, %r__
  *       0xff, 0xe0   = jmpq *%rax
+ *       0xe9, [le32] = jmpq *(%rip + $imm32)
  */
 
 typedef uint32_t (*one_param_func_ptr)(uint32_t);
@@ -66,30 +67,41 @@ one_param_func_ptr curry_two_param_func(
     void *two_param_func,
     uint32_t second_param)
 {
-    /* This is a template for calling a "curried" version of
-     * uint32_t (*two_param_func)(uint32_t a, uint32_t b),
+    /* We create a small buffer for executable code on the HEAP.
+     * We fill it in with a "curried" version of
+     *   uint32_t (*two_param_func)(uint32_t a, uint32_t b),
      * using the Linux x86-64 ABI. The curried version can be
-     * treated as uint32_t (*one_param_func)(uint32_t a).
+     * treated as if it were
+     *   uint32_t (*one_param_func)(uint32_t a).
      */
-    uintptr_t fp = (uintptr_t)two_param_func;
-    uint8_t template[] = {
-        0xbe, 0, 0, 0, 0,                                   /* movl $imm32, %esi */
-        0x48, 0xb8, fp >>  0, fp >>  8, fp >> 16, fp >> 24, /* movq fp, %rax */
-                    fp >> 32, fp >> 40, fp >> 48, fp >> 56,
-        0xff, 0xe0                                          /* jmpq *%rax */
-    };
-
-    /* Now we create a copy of this template on the HEAP, and
-     * fill in the second param. */
-    uint8_t *buf = malloc(sizeof(template));
+    const size_t BUFSZ = 17;
+    uint8_t *volatile buf = malloc(BUFSZ);
     if (!buf)
         return NULL;
 
-    memcpy(buf, template, sizeof(template));
-    buf[1] = second_param >> 0;
-    buf[2] = second_param >> 8;
-    buf[3] = second_param >> 16;
-    buf[4] = second_param >> 24;
+
+    /* If relative jump offset fits in 32 bits, then we
+     * use RIP-relative JMP and fit it all in 10 bytes:
+     *     movl $imm32, %esi       ; $imm32 = second_param
+     *     jmpl %rip + $imm32      ; $imm32 = offset of fp
+     * 
+     * ... otherwise we need all 17 bytes:
+     *
+     *     movl $imm32, %esi       ; $imm32 = second_param
+     *     movq $imm64, %rax	   ; $imm64 = fp
+     *     jmpq *%rax
+     */
+    uintptr_t fp = (uintptr_t)two_param_func;
+    intptr_t rel = (uint8_t*)two_param_func - &buf[10];
+    buf[0] = 0xbe; *(uint32_t*)(buf+1) = second_param    ; /* movl $imm32, %esi */
+    if (rel >= INT32_MIN && rel <= INT32_MAX) {
+	printf("rel = %s0x%08lx\n", rel < 0 ? "-" : "", rel < 0 ? -rel : rel);
+	buf[5] = 0xe9; *(int32_t*)(&buf[6]) = rel;         /* jmpl *(%rip + $imm32) */ 
+    } else {
+	buf[5] = 0x48; buf[6] = 0xb8;                      /* movq $imm64, %rax */
+	*(uintptr_t*)&buf[7] = fp;         
+	buf[15] = 0xff; buf[16] = 0xe0;                    /* jmpq *%rax */
+    }
 
     /* We do NOT want to make the stack executable,
      * but we NEED the heap-allocated buf to be executable.
@@ -100,7 +112,7 @@ one_param_func_ptr curry_two_param_func(
      */
     uintptr_t pagesize = sysconf(_SC_PAGE_SIZE);
     mprotect((void *)PAGE_START(buf),
-             PAGE_END(buf + sizeof(template)) - PAGE_START(buf),
+             PAGE_END(buf + BUFSZ) - PAGE_START(buf),
              PROT_READ|PROT_WRITE|PROT_EXEC);
 
     return (one_param_func_ptr)buf;
